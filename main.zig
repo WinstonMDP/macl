@@ -1,7 +1,7 @@
 pub fn main() !void {
     const argv = os.argv;
     if (argv.len != 2) {
-        log.err("Expected just one argument", .{});
+        log.err("Expected just one argument, found {d}", .{argv.len - 1});
         return error.Err;
     }
     const path = argv[1];

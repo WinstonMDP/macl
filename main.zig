@@ -6,39 +6,116 @@ pub fn main() !void {
     }
     const path = argv[1];
 
-    var optional_db: ?*c.sqlite3 = undefined;
-    if (c.sqlite3_open("db.db", &optional_db) != c.SQLITE_OK) {
-        log.err("Can't open the db", .{});
-        return error.Err;
-    }
-    if (optional_db == null) {
-        log.err("Can't open the db: null", .{});
-        return error.Err;
-    }
-    defer if (c.sqlite3_close(optional_db) != c.SQLITE_OK)
-        log.err("Can't destroy the db", .{});
-    const db = optional_db.?;
+    try openDb();
+    defer if (c.sqlite3_close(db) != c.SQLITE_OK)
+        log.err("Can't close the db: {s}", .{c.sqlite3_errmsg(db)});
 
-    try createTables(db);
+    try createTables();
 
     var statbuf: Stat = undefined;
     if (stat(path, &statbuf) != 0) {
         log.err("Can't get stat", .{});
         return error.Err;
     }
-    try handlePath(db, path);
+
+    try prepareStmts();
+    defer {
+        if (c.sqlite3_finalize(insert_file_stmt) != c.SQLITE_OK)
+            log.err("Can't finalize a stmt: {s}", .{c.sqlite3_errmsg(db)});
+        if (c.sqlite3_finalize(insert_user_perms_stmt) != c.SQLITE_OK)
+            log.err("Can't finalize a stmt: {s}", .{c.sqlite3_errmsg(db)});
+        if (c.sqlite3_finalize(insert_group_perms_stmt) != c.SQLITE_OK)
+            log.err("Can't finalize a stmt: {s}", .{c.sqlite3_errmsg(db)});
+    }
+
+    try handlePath(path);
     if (ISDIR(statbuf.mode)) {
         const dir = try openDirAbsoluteZ(path, .{ .iterate = true });
         var walker = try dir.walk(allocator);
         defer walker.deinit();
-        while (try walker.next()) |entry| try handlePath(
-            db,
-            try fs.path.joinZ(allocator, &.{ span(path), entry.basename }),
-        );
+        while (try walker.next()) |entry|
+            try handlePath(try fs.path.joinZ(allocator, &.{ span(path), entry.path }));
     }
 }
 
-fn createTables(db: *c.sqlite3) !void {
+fn openDb() !void {
+    var opt_db: ?*c.sqlite3 = undefined;
+    if (c.sqlite3_open("db.db", &opt_db) != c.SQLITE_OK) {
+        log.err("Can't open the db", .{});
+        return error.Err;
+    }
+    if (opt_db == null) {
+        log.err("Can't open the db: null", .{});
+        return error.Err;
+    }
+    db = opt_db.?;
+}
+
+fn prepareStmts() !void {
+    var tail: ?[*]const u8 = undefined;
+
+    var opt_insert_file_stmt: ?*c.sqlite3_stmt = undefined;
+    if (c.sqlite3_prepare_v2(
+        db,
+        \\INSERT INTO files(
+        \\    path,
+        \\    user_obj_name,
+        \\    user_obj,
+        \\    group_obj_name,
+        \\    group_obj,
+        \\    mask,
+        \\    other
+        \\) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    ,
+        1024,
+        &opt_insert_file_stmt,
+        &tail,
+    ) != c.SQLITE_OK) {
+        log.err(
+            "Can't prepare an file insertion statement: {s}",
+            .{c.sqlite3_errmsg(db)},
+        );
+        return error.Err;
+    }
+    assert(tail.?[0] == 0);
+    insert_file_stmt = opt_insert_file_stmt.?;
+
+    var opt_insert_user_perms_stmt: ?*c.sqlite3_stmt = undefined;
+    if (c.sqlite3_prepare_v2(
+        db,
+        "INSERT INTO user_perms(file_id, user_name, perms) VALUES(?1, ?2, ?3)",
+        1024,
+        &opt_insert_user_perms_stmt,
+        &tail,
+    ) != c.SQLITE_OK) {
+        log.err(
+            "Can't prepare an user perms insertion statement: {s}",
+            .{c.sqlite3_errmsg(db)},
+        );
+        return error.Err;
+    }
+    assert(tail.?[0] == 0);
+    insert_user_perms_stmt = opt_insert_user_perms_stmt.?;
+
+    var opt_insert_group_perms_stmt: ?*c.sqlite3_stmt = undefined;
+    if (c.sqlite3_prepare_v2(
+        db,
+        "INSERT INTO group_perms(file_id, group_name, perms) VALUES(?1, ?2, ?3)",
+        1024,
+        &opt_insert_group_perms_stmt,
+        &tail,
+    ) != c.SQLITE_OK) {
+        log.err(
+            "Can't prepare a group perms insertion statement: {s}",
+            .{c.sqlite3_errmsg(db)},
+        );
+        return error.Err;
+    }
+    assert(tail.?[0] == 0);
+    insert_group_perms_stmt = opt_insert_group_perms_stmt.?;
+}
+
+fn createTables() !void {
     var errmsg: [*c]u8 = undefined;
     if (c.sqlite3_exec(
         db,
@@ -74,238 +151,191 @@ fn createTables(db: *c.sqlite3) !void {
     }
 }
 
-fn handlePath(db: *c.struct_sqlite3, path: [*:0]const u8) !void {
-    const acl = try Acl.init(path);
+fn handlePath(path: [*:0]const u8) !void {
+    const acl = try Acl.init(allocator, path);
 
-    try insertFile(db, acl, path);
+    try insertFile(acl, path);
 
     const file_id = c.sqlite3_last_insert_rowid(db);
-    try insertUserPerms(db, file_id, acl.users);
-    try insertGroupPerms(db, file_id, acl.groups);
+    try insertUserPerms(file_id, acl.users);
+    try insertGroupPerms(file_id, acl.groups);
 }
 
-fn insertFile(db: *c.struct_sqlite3, acl: Acl, path: [*:0]const u8) !void {
-    const files_insert_query = try fmt.allocPrint(
-        allocator,
-        \\INSERT INTO files(
-        \\    path,
-        \\    user_obj_name,
-        \\    user_obj,
-        \\    group_obj_name,
-        \\    group_obj,
-        \\    mask,
-        \\    other
-        \\) VALUES("{s}", "{s}", {d}, "{s}", {d}, {?d}, {d});
-    ,
-        .{
-            path,
-            acl.user_obj_name,
-            acl.user_obj,
-            acl.group_obj_name,
-            acl.group_obj,
-            acl.mask,
-            acl.other,
-        },
-    );
-    var errmsg: [*c]u8 = undefined;
-    if (c.sqlite3_exec(
-        db,
-        files_insert_query.ptr,
-        null,
-        null,
-        &errmsg,
+fn insertFile(acl: Acl, path: [*:0]const u8) !void {
+    if (c.sqlite3_reset(insert_file_stmt) != c.SQLITE_OK) {
+        log.err("Can't reset a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+
+    if (c.sqlite3_bind_text(
+        insert_file_stmt,
+        1,
+        path,
+        @intCast(len(path)),
+        c.SQLITE_TRANSIENT,
     ) != c.SQLITE_OK) {
-        log.err("Can't insert data: {s}", .{errmsg});
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+    if (c.sqlite3_bind_text(
+        insert_file_stmt,
+        2,
+        acl.user_obj_name,
+        @intCast(len(acl.group_obj_name)),
+        c.SQLITE_TRANSIENT,
+    ) != c.SQLITE_OK) {
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+    if (c.sqlite3_bind_int(insert_file_stmt, 3, acl.user_obj) != c.SQLITE_OK) {
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+    if (c.sqlite3_bind_text(
+        insert_file_stmt,
+        4,
+        acl.group_obj_name,
+        @intCast(len(acl.group_obj_name)),
+        c.SQLITE_TRANSIENT,
+    ) != c.SQLITE_OK) {
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+    if (c.sqlite3_bind_int(insert_file_stmt, 5, acl.group_obj) != c.SQLITE_OK) {
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+    if (acl.mask) |mask| {
+        if (c.sqlite3_bind_int(insert_file_stmt, 6, mask) != c.SQLITE_OK) {
+            log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+            return error.Err;
+        }
+    } else if (c.sqlite3_bind_null(insert_file_stmt, 6) != c.SQLITE_OK) {
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+    if (c.sqlite3_bind_int(insert_file_stmt, 7, acl.other) != c.SQLITE_OK) {
+        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+        return error.Err;
+    }
+
+    if (c.sqlite3_step(insert_file_stmt) != c.SQLITE_DONE) {
+        log.err("Can't insert file: {s}", .{c.sqlite3_errmsg(db)});
         return error.Err;
     }
 }
+
+var insert_file_stmt: *c.sqlite3_stmt = undefined;
 
 fn insertUserPerms(
-    db: *c.struct_sqlite3,
     file_id: c.sqlite3_int64,
-    users: []const PermRecord,
+    users: []const Acl.PermRecord,
 ) !void {
-    var errmsg: [*c]u8 = undefined;
     for (users) |user| {
-        const query = (try fmt.allocPrint(
-            allocator,
-            "INSERT INTO user_perms(file_id, user_name, perms) VALUES({d}, \"{s}\", {d})",
-            .{
-                file_id,
-                user.name,
-                user.perms,
-            },
-        )).ptr;
-        if (c.sqlite3_exec(
-            db,
-            query,
-            null,
-            null,
-            &errmsg,
+        if (c.sqlite3_reset(insert_user_perms_stmt) != c.SQLITE_OK) {
+            log.err(
+                "Can't reset an user perms insertion statement: {s}",
+                .{c.sqlite3_errmsg(db)},
+            );
+            return error.Err;
+        }
+
+        if (c.sqlite3_bind_int64(insert_user_perms_stmt, 1, file_id) != c.SQLITE_OK) {
+            log.err(
+                "Can't bind an user perms insertion statement: {s}",
+                .{c.sqlite3_errmsg(db)},
+            );
+            return error.Err;
+        }
+        if (c.sqlite3_bind_text(
+            insert_user_perms_stmt,
+            2,
+            user.name,
+            @intCast(len(user.name)),
+            c.SQLITE_TRANSIENT,
         ) != c.SQLITE_OK) {
-            log.err("Can't insert user", .{});
+            log.err("Can't bind an user perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+            return error.Err;
+        }
+        if (c.sqlite3_bind_int(insert_user_perms_stmt, 3, user.perms) != c.SQLITE_OK) {
+            log.err("Can't bind an user perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+            return error.Err;
+        }
+
+        if (c.sqlite3_step(insert_user_perms_stmt) != c.SQLITE_DONE) {
+            log.err("Can't insert user perms: {s}", .{c.sqlite3_errmsg(db)});
             return error.Err;
         }
     }
 }
 
-fn insertGroupPerms(
-    db: *c.struct_sqlite3,
-    file_id: c.sqlite3_int64,
-    groups: []const PermRecord,
-) !void {
-    var errmsg: [*c]u8 = undefined;
+var insert_user_perms_stmt: *c.sqlite3_stmt = undefined;
+
+fn insertGroupPerms(file_id: c.sqlite3_int64, groups: []const Acl.PermRecord) !void {
     for (groups) |group| {
-        const query = (try fmt.allocPrint(
-            allocator,
-            "INSERT INTO group_perms(file_id, group_name, perms) VALUES({d}, \"{s}\", {d})",
-            .{
-                file_id,
-                group.name,
-                group.perms,
-            },
-        )).ptr;
-        if (c.sqlite3_exec(
-            db,
-            query,
-            null,
-            null,
-            &errmsg,
+        if (c.sqlite3_reset(insert_group_perms_stmt) != c.SQLITE_OK) {
+            log.err(
+                "Can't reset a group perms insertion statement: {s}",
+                .{c.sqlite3_errmsg(db)},
+            );
+            return error.Err;
+        }
+
+        if (c.sqlite3_bind_int64(insert_group_perms_stmt, 1, file_id) != c.SQLITE_OK) {
+            log.err("Can't bind a group perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+            return error.Err;
+        }
+        if (c.sqlite3_bind_text(
+            insert_group_perms_stmt,
+            2,
+            group.name,
+            @intCast(len(group.name)),
+            c.SQLITE_TRANSIENT,
         ) != c.SQLITE_OK) {
-            log.err("Can't insert group: {s}", .{errmsg});
+            log.err("Can't bind a group perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+            return error.Err;
+        }
+        if (c.sqlite3_bind_int(insert_group_perms_stmt, 3, group.perms) != c.SQLITE_OK) {
+            log.err("Can't bind a group perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
+            return error.Err;
+        }
+
+        if (c.sqlite3_step(insert_group_perms_stmt) != c.SQLITE_DONE) {
+            log.err("Can't insert a group perms: {s}", .{c.sqlite3_errmsg(db)});
             return error.Err;
         }
     }
 }
 
-const Acl = struct {
-    user_obj: u3,
-    user_obj_name: [*:0]const u8,
-    group_obj: u3,
-    group_obj_name: [*:0]const u8,
-    mask: ?u3,
-    other: u3,
-    users: []const PermRecord,
-    groups: []const PermRecord,
+var insert_group_perms_stmt: *c.sqlite3_stmt = undefined;
 
-    fn init(path: [*:0]const u8) !@This() {
-        const c_acl = c.acl_get_file(path, c.ACL_TYPE_ACCESS) orelse {
-            log.err("Can't get an acl of file {s}", .{path});
-            return error.Err;
-        };
+var db: *c.sqlite3 = undefined;
 
-        var acl: @This() = undefined;
-        acl.group_obj_name = "";
-        acl.user_obj_name = "";
-        acl.mask = null;
-
-        var users = ArrayList(PermRecord).init(allocator);
-        var groups = ArrayList(PermRecord).init(allocator);
-
-        var statbuf: Stat = undefined;
-        if (stat(path, &statbuf) != 0) {
-            log.err("Can't get stat", .{});
-            return error.Err;
-        }
-
-        var entry_id = c.ACL_FIRST_ENTRY;
-        var entry: c.acl_entry_t = undefined;
-        while (c.acl_get_entry(c_acl, entry_id, &entry) == 1) {
-            try handleEntry(entry, &acl, &users, &groups, statbuf);
-            entry_id = c.ACL_NEXT_ENTRY;
-        }
-
-        acl.users = users.items;
-        acl.groups = groups.items;
-        return acl;
-    }
-};
-
-const PermRecord = struct {
-    name: [*:0]u8,
-    perms: u3,
-};
-
-fn handleEntry(
-    entry: c.acl_entry_t,
-    acl: *Acl,
-    users: *ArrayList(PermRecord),
-    groups: *ArrayList(PermRecord),
-    statbuf: Stat,
-) !void {
-    var tag_type: c.acl_tag_t = undefined;
-    if (c.acl_get_tag_type(entry, &tag_type) == -1) {
-        log.err("Can't get an acl tag", .{});
-        return error.Err;
-    }
-    switch (tag_type) {
-        c.ACL_USER_OBJ => {
-            acl.user_obj = perms(entry);
-            acl.user_obj_name = c.getpwuid(statbuf.uid).*.pw_name;
-        },
-        c.ACL_USER => {
-            const uid: *c.uid_t = @ptrCast(@alignCast(c.acl_get_qualifier(entry).?));
-            try users.append(.{
-                .name = c.getpwuid(uid.*).*.pw_name,
-                .perms = perms(entry),
-            });
-        },
-        c.ACL_GROUP_OBJ => {
-            acl.group_obj = perms(entry);
-            acl.group_obj_name = c.getpwuid(statbuf.gid).*.pw_name;
-        },
-        c.ACL_GROUP => {
-            const gid: *c.gid_t = @ptrCast(@alignCast(c.acl_get_qualifier(entry).?));
-            try groups.append(.{
-                .name = c.getgrgid(gid.*).*.gr_name,
-                .perms = perms(entry),
-            });
-        },
-        c.ACL_MASK => {
-            acl.mask = perms(entry);
-        },
-        c.ACL_OTHER => {
-            acl.other = perms(entry);
-        },
-        else => undefined,
-    }
-}
-
-fn perms(entry: c.acl_entry_t) u3 {
-    var permset: c.acl_permset_t = undefined;
-    if (c.acl_get_permset(entry, &permset) == -1) {
-        log.err("Can't get permset", .{});
-    }
-
-    var output: u3 = 0;
-    output |= @intCast(c.acl_get_perm(permset, c.ACL_EXECUTE));
-    output |= @intCast(c.acl_get_perm(permset, c.ACL_WRITE) << 1);
-    output |= @intCast(c.acl_get_perm(permset, c.ACL_READ) << 2);
-
-    return output;
-}
+var debug_allocator = std.heap.DebugAllocator(std.heap.DebugAllocatorConfig{}).init;
+const allocator = debug_allocator.allocator();
 
 const std = @import("std");
-const debug = std.debug;
 const log = std.log;
-const ArrayList = std.ArrayList;
 const fmt = std.fmt;
+
+const debug = std.debug;
+const assert = debug.assert;
+
 const os = std.os;
 const linux = os.linux;
 const stat = linux.stat;
 const Stat = linux.Stat;
 const ISDIR = linux.S.ISDIR;
-const openDirAbsoluteZ = std.fs.openDirAbsoluteZ;
-const fs = std.fs;
-const span = std.mem.span;
 
-var debug_allocator = std.heap.DebugAllocator(std.heap.DebugAllocatorConfig{}).init;
-const allocator = debug_allocator.allocator();
+const fs = std.fs;
+const openDirAbsoluteZ = fs.openDirAbsoluteZ;
+
+const mem = std.mem;
+const span = mem.span;
+const len = mem.len;
+
+const Acl = @import("Acl.zig");
 
 const c = @cImport({
-    @cInclude("sys/acl.h");
-    @cInclude("acl/libacl.h");
-    @cInclude("pwd.h");
-    @cInclude("grp.h");
     @cInclude("sqlite3.h");
 });

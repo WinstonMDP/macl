@@ -167,57 +167,15 @@ fn insertFile(acl: Acl, path: [*:0]const u8) !void {
         return error.Err;
     }
 
-    if (c.sqlite3_bind_text(
-        insert_file_stmt,
-        1,
+    try bind(insert_file_stmt, .{
         path,
-        @intCast(len(path)),
-        c.SQLITE_TRANSIENT,
-    ) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
-    if (c.sqlite3_bind_text(
-        insert_file_stmt,
-        2,
         acl.user_obj_name,
-        @intCast(len(acl.group_obj_name)),
-        c.SQLITE_TRANSIENT,
-    ) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
-    if (c.sqlite3_bind_int(insert_file_stmt, 3, acl.user_obj) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
-    if (c.sqlite3_bind_text(
-        insert_file_stmt,
-        4,
+        acl.user_obj,
         acl.group_obj_name,
-        @intCast(len(acl.group_obj_name)),
-        c.SQLITE_TRANSIENT,
-    ) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
-    if (c.sqlite3_bind_int(insert_file_stmt, 5, acl.group_obj) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
-    if (acl.mask) |mask| {
-        if (c.sqlite3_bind_int(insert_file_stmt, 6, mask) != c.SQLITE_OK) {
-            log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-            return error.Err;
-        }
-    } else if (c.sqlite3_bind_null(insert_file_stmt, 6) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
-    if (c.sqlite3_bind_int(insert_file_stmt, 7, acl.other) != c.SQLITE_OK) {
-        log.err("Can't bind a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-        return error.Err;
-    }
+        acl.group_obj,
+        acl.mask,
+        acl.other,
+    });
 
     if (c.sqlite3_step(insert_file_stmt) != c.SQLITE_DONE) {
         log.err("Can't insert file: {s}", .{c.sqlite3_errmsg(db)});
@@ -240,27 +198,7 @@ fn insertUserPerms(
             return error.Err;
         }
 
-        if (c.sqlite3_bind_int64(insert_user_perms_stmt, 1, file_id) != c.SQLITE_OK) {
-            log.err(
-                "Can't bind an user perms insertion statement: {s}",
-                .{c.sqlite3_errmsg(db)},
-            );
-            return error.Err;
-        }
-        if (c.sqlite3_bind_text(
-            insert_user_perms_stmt,
-            2,
-            user.name,
-            @intCast(len(user.name)),
-            c.SQLITE_TRANSIENT,
-        ) != c.SQLITE_OK) {
-            log.err("Can't bind an user perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-            return error.Err;
-        }
-        if (c.sqlite3_bind_int(insert_user_perms_stmt, 3, user.perms) != c.SQLITE_OK) {
-            log.err("Can't bind an user perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-            return error.Err;
-        }
+        try bind(insert_user_perms_stmt, .{ file_id, user.name, user.perms });
 
         if (c.sqlite3_step(insert_user_perms_stmt) != c.SQLITE_DONE) {
             log.err("Can't insert user perms: {s}", .{c.sqlite3_errmsg(db)});
@@ -281,24 +219,7 @@ fn insertGroupPerms(file_id: c.sqlite3_int64, groups: []const Acl.PermRecord) !v
             return error.Err;
         }
 
-        if (c.sqlite3_bind_int64(insert_group_perms_stmt, 1, file_id) != c.SQLITE_OK) {
-            log.err("Can't bind a group perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-            return error.Err;
-        }
-        if (c.sqlite3_bind_text(
-            insert_group_perms_stmt,
-            2,
-            group.name,
-            @intCast(len(group.name)),
-            c.SQLITE_TRANSIENT,
-        ) != c.SQLITE_OK) {
-            log.err("Can't bind a group perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-            return error.Err;
-        }
-        if (c.sqlite3_bind_int(insert_group_perms_stmt, 3, group.perms) != c.SQLITE_OK) {
-            log.err("Can't bind a group perms insertion statement: {s}", .{c.sqlite3_errmsg(db)});
-            return error.Err;
-        }
+        try bind(insert_group_perms_stmt, .{ file_id, group.name, group.perms });
 
         if (c.sqlite3_step(insert_group_perms_stmt) != c.SQLITE_DONE) {
             log.err("Can't insert a group perms: {s}", .{c.sqlite3_errmsg(db)});
@@ -309,6 +230,43 @@ fn insertGroupPerms(file_id: c.sqlite3_int64, groups: []const Acl.PermRecord) !v
 
 var insert_group_perms_stmt: *c.sqlite3_stmt = undefined;
 
+fn bind(stmt: *c.sqlite3_stmt, args: anytype) !void {
+    inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |field| {
+        const id = comptime parseInt(u8, field.name, 10) catch unreachable;
+        switch (field.type) {
+            [*:0]const u8, [*:0]u8 => if (c.sqlite3_bind_text(
+                stmt,
+                id + 1,
+                args[id],
+                @intCast(len(args[id])),
+                c.SQLITE_TRANSIENT,
+            ) != c.SQLITE_OK) {
+                log.err("Can't bind a statement: {s}", .{c.sqlite3_errmsg(db)});
+                return error.Err;
+            },
+            u3 => if (c.sqlite3_bind_int(stmt, id + 1, args[id]) != c.SQLITE_OK) {
+                log.err("Can't bind a statement: {s}", .{c.sqlite3_errmsg(db)});
+                return error.Err;
+            },
+            ?u3 => {
+                const res = if (args[id]) |arg|
+                    c.sqlite3_bind_int(stmt, id + 1, arg)
+                else
+                    c.sqlite3_bind_null(stmt, id + 1);
+                if (res != c.SQLITE_OK) {
+                    log.err("Can't bind a statement: {s}", .{c.sqlite3_errmsg(db)});
+                    return error.Err;
+                }
+            },
+            c_longlong => if (c.sqlite3_bind_int64(stmt, id + 1, args[id]) != c.SQLITE_OK) {
+                log.err("Can't bind a statement: {s}", .{c.sqlite3_errmsg(db)});
+                return error.Err;
+            },
+            else => @compileError("Unimplemented binding for " ++ @typeName(field.type)),
+        }
+    }
+}
+
 var db: *c.sqlite3 = undefined;
 
 var debug_allocator = std.heap.DebugAllocator(std.heap.DebugAllocatorConfig{}).init;
@@ -316,7 +274,9 @@ const allocator = debug_allocator.allocator();
 
 const std = @import("std");
 const log = std.log;
+
 const fmt = std.fmt;
+const parseInt = fmt.parseInt;
 
 const debug = std.debug;
 const assert = debug.assert;

@@ -1,41 +1,12 @@
 pub fn main() !void {
-    const argv = os.argv;
-    if (argv.len != 2 and argv.len != 3) {
-        log.err("Expected 1 or 2 arguments, found {d}", .{argv.len - 1});
-        return error.Err;
-    }
-
-    if (argv.len == 2) {
-        if (mem.eql(u8, span(argv[1]), "--help")) {
-            try std.io.getStdOut().writeAll("macl path_to_sqlite3_db path_to_scan\n");
-            return;
-        } else {
-            log.err("An unrecognized command", .{});
-            return error.Err;
-        }
-    }
-
-    const db_path = argv[1];
-    const path = if (fs.path.isAbsoluteZ(argv[2]))
-        argv[2]
-    else out: {
-        var buf: [fs.max_path_bytes]u8 = undefined;
-        const realpath = try cwd().realpathZ(argv[2], &buf);
-        buf[realpath.len] = 0;
-        break :out buf[0..realpath.len :0].ptr;
-    };
+    var buf: [fs.max_path_bytes]u8 = undefined;
+    const db_path, const path = try parseArgs(&buf) orelse return;
 
     try openDb(db_path);
     defer if (c.sqlite3_close(db) != c.SQLITE_OK)
         log.err("Can't close the db: {s}", .{c.sqlite3_errmsg(db)});
 
     try createTables();
-
-    var statbuf: Stat = undefined;
-    if (stat(path, &statbuf) != 0) {
-        log.err("Can't get stat", .{});
-        return error.Err;
-    }
 
     try prepareStmts();
     defer {
@@ -47,14 +18,63 @@ pub fn main() !void {
             log.err("Can't finalize a stmt: {s}", .{c.sqlite3_errmsg(db)});
     }
 
-    try handlePath(path);
+    try handleRootPath(path);
+}
+
+fn handleRootPath(path: [*:0]u8) !void {
+    var statbuf: Stat = undefined;
+    if (stat(path, &statbuf) != 0) {
+        log.err("Can't get stat", .{});
+        return error.Err;
+    }
+
+    parent_progress_node = Progress.start(.{});
+    handlePath(path);
+    if (handle_path_err) |err| return err;
     if (ISDIR(statbuf.mode)) {
         const dir = try openDirAbsoluteZ(path, .{ .iterate = true });
         var walker = try dir.walk(allocator);
-        defer walker.deinit();
+        var pool: Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+        var wg = WaitGroup{};
         while (try walker.next()) |entry|
-            try handlePath(try fs.path.joinZ(allocator, &.{ span(path), entry.path }));
+            pool.spawnWg(
+                &wg,
+                handlePath,
+                .{try fs.path.joinZ(allocator, &.{ span(path), entry.path })},
+            );
+        wg.wait();
+        if (handle_path_err) |err| return err;
     }
+}
+
+fn parseArgs(buf: []u8) !?[2][*:0]u8 {
+    const argv = os.argv;
+    if (argv.len != 2 and argv.len != 3) {
+        log.err("Expected 1 or 2 arguments, found {d}", .{argv.len - 1});
+        return error.Err;
+    }
+
+    if (argv.len == 2) {
+        if (mem.eql(u8, span(argv[1]), "--help")) {
+            try std.io.getStdOut().writeAll("macl path_to_sqlite3_db path_to_scan\n");
+            return null;
+        } else {
+            log.err("An unrecognized command", .{});
+            return error.Err;
+        }
+    }
+
+    const db_path = argv[1];
+    const path = if (fs.path.isAbsoluteZ(argv[2]))
+        argv[2]
+    else out: {
+        const realpath = try cwd().realpathZ(argv[2], buf);
+        buf[realpath.len] = 0;
+        break :out buf[0..realpath.len :0].ptr;
+    };
+    return .{ db_path, path };
 }
 
 fn openDb(path: [*:0]const u8) !void {
@@ -91,7 +111,7 @@ fn prepareStmts() !void {
         &tail,
     ) != c.SQLITE_OK) {
         log.err(
-            "Can't prepare an file insertion statement: {s}",
+            "Can't prepare a file insertion statement: {s}",
             .{c.sqlite3_errmsg(db)},
         );
         return error.Err;
@@ -170,17 +190,45 @@ fn createTables() !void {
     }
 }
 
-fn handlePath(path: [*:0]const u8) !void {
-    const acl = try Acl.init(allocator, path);
+fn handlePath(path: [*:0]const u8) void {
+    const progress_node = parent_progress_node.start(span(path), 0);
+    defer progress_node.end();
 
-    try insertFile(acl, path);
+    const acl = Acl.init(allocator, path) catch |err| {
+        setHandlePathErr(err);
+        return;
+    };
 
-    const file_id = c.sqlite3_last_insert_rowid(db);
-    try insertUserPerms(file_id, acl.users);
-    try insertGroupPerms(file_id, acl.groups);
+    const file_id = insertFile(acl, path) catch |err| {
+        setHandlePathErr(err);
+        return;
+    };
+
+    insertUserPerms(file_id, acl.users) catch |err| {
+        setHandlePathErr(err);
+        return;
+    };
+
+    insertGroupPerms(file_id, acl.groups) catch |err| {
+        setHandlePathErr(err);
+        return;
+    };
 }
 
-fn insertFile(acl: Acl, path: [*:0]const u8) !void {
+var parent_progress_node: Progress.Node = undefined;
+
+fn setHandlePathErr(err: anyerror) void {
+    handle_path_err_mtx.lock();
+    handle_path_err = err;
+    handle_path_err_mtx.unlock();
+}
+
+var handle_path_err_mtx = Mutex{};
+var handle_path_err: ?anyerror = null;
+
+fn insertFile(acl: Acl, path: [*:0]const u8) !c.sqlite3_int64 {
+    insert_file_stmt_mtx.lock();
+    defer insert_file_stmt_mtx.unlock();
     if (c.sqlite3_reset(insert_file_stmt) != c.SQLITE_OK) {
         log.err("Can't reset a file insertion statement: {s}", .{c.sqlite3_errmsg(db)});
         return error.Err;
@@ -200,14 +248,15 @@ fn insertFile(acl: Acl, path: [*:0]const u8) !void {
         log.err("Can't insert file: {s}", .{c.sqlite3_errmsg(db)});
         return error.Err;
     }
+    return c.sqlite3_last_insert_rowid(db);
 }
 
 var insert_file_stmt: *c.sqlite3_stmt = undefined;
+var insert_file_stmt_mtx = Mutex{};
 
-fn insertUserPerms(
-    file_id: c.sqlite3_int64,
-    users: []const Acl.PermRecord,
-) !void {
+fn insertUserPerms(file_id: c.sqlite3_int64, users: []const Acl.PermRecord) !void {
+    insert_user_perms_stmt_mtx.lock();
+    defer insert_user_perms_stmt_mtx.unlock();
     for (users) |user| {
         if (c.sqlite3_reset(insert_user_perms_stmt) != c.SQLITE_OK) {
             log.err(
@@ -227,8 +276,11 @@ fn insertUserPerms(
 }
 
 var insert_user_perms_stmt: *c.sqlite3_stmt = undefined;
+var insert_user_perms_stmt_mtx = Mutex{};
 
 fn insertGroupPerms(file_id: c.sqlite3_int64, groups: []const Acl.PermRecord) !void {
+    insert_group_perms_stmt_mtx.lock();
+    defer insert_group_perms_stmt_mtx.unlock();
     for (groups) |group| {
         if (c.sqlite3_reset(insert_group_perms_stmt) != c.SQLITE_OK) {
             log.err(
@@ -248,6 +300,7 @@ fn insertGroupPerms(file_id: c.sqlite3_int64, groups: []const Acl.PermRecord) !v
 }
 
 var insert_group_perms_stmt: *c.sqlite3_stmt = undefined;
+var insert_group_perms_stmt_mtx = Mutex{};
 
 fn bind(stmt: *c.sqlite3_stmt, args: anytype) !void {
     inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |field| {
@@ -288,12 +341,13 @@ fn bind(stmt: *c.sqlite3_stmt, args: anytype) !void {
 
 var db: *c.sqlite3 = undefined;
 
-var debug_allocator = std.heap.DebugAllocator(std.heap.DebugAllocatorConfig{}).init;
+var debug_allocator = std.heap.DebugAllocator(.{}).init;
 const allocator = debug_allocator.allocator();
 
 const std = @import("std");
 const log = std.log;
 const getStdErr = std.io.getStdErr;
+const Progress = std.Progress;
 
 const fmt = std.fmt;
 const parseInt = fmt.parseInt;
@@ -315,10 +369,13 @@ const mem = std.mem;
 const span = mem.span;
 const len = mem.len;
 
+const Thread = std.Thread;
+const Pool = Thread.Pool;
+const WaitGroup = Thread.WaitGroup;
+const Mutex = Thread.Mutex;
+
 const Acl = @import("Acl.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
-
-const clap = @import("clap");

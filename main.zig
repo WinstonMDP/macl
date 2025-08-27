@@ -1,12 +1,24 @@
 pub fn main() !void {
     const argv = os.argv;
-    if (argv.len != 2) {
-        log.err("Expected just one argument, found {d}", .{argv.len - 1});
+    if (argv.len != 2 and argv.len != 3) {
+        log.err("Expected 1 or 2 arguments, found {d}", .{argv.len - 1});
         return error.Err;
     }
-    const path = argv[1];
 
-    try openDb();
+    if (argv.len == 2) {
+        if (mem.eql(u8, span(argv[1]), "--help")) {
+            try std.io.getStdOut().writeAll("macl path_to_sqlite3_db path_to_scan\n");
+            return;
+        } else {
+            log.err("An unrecognized command", .{});
+            return error.Err;
+        }
+    }
+
+    const db_path = argv[1];
+    const path = argv[2];
+
+    try openDb(db_path);
     defer if (c.sqlite3_close(db) != c.SQLITE_OK)
         log.err("Can't close the db: {s}", .{c.sqlite3_errmsg(db)});
 
@@ -38,9 +50,9 @@ pub fn main() !void {
     }
 }
 
-fn openDb() !void {
+fn openDb(path: [*:0]const u8) !void {
     var opt_db: ?*c.sqlite3 = undefined;
-    if (c.sqlite3_open("db.db", &opt_db) != c.SQLITE_OK) {
+    if (c.sqlite3_open(path, &opt_db) != c.SQLITE_OK) {
         log.err("Can't open the db", .{});
         return error.Err;
     }
@@ -274,6 +286,7 @@ const allocator = debug_allocator.allocator();
 
 const std = @import("std");
 const log = std.log;
+const getStdErr = std.io.getStdErr;
 
 const fmt = std.fmt;
 const parseInt = fmt.parseInt;
@@ -299,3 +312,5 @@ const Acl = @import("Acl.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
+
+const clap = @import("clap");

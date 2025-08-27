@@ -16,7 +16,14 @@ pub fn main() !void {
     }
 
     const db_path = argv[1];
-    const path = argv[2];
+    const path = if (fs.path.isAbsoluteZ(argv[2]))
+        argv[2]
+    else out: {
+        var buf: [fs.max_path_bytes]u8 = undefined;
+        const realpath = try cwd().realpathZ(argv[2], &buf);
+        buf[realpath.len] = 0;
+        break :out buf[0..realpath.len :0].ptr;
+    };
 
     try openDb(db_path);
     defer if (c.sqlite3_close(db) != c.SQLITE_OK)
@@ -302,6 +309,7 @@ const ISDIR = linux.S.ISDIR;
 
 const fs = std.fs;
 const openDirAbsoluteZ = fs.openDirAbsoluteZ;
+const cwd = fs.cwd;
 
 const mem = std.mem;
 const span = mem.span;
